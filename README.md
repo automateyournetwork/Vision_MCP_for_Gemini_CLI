@@ -20,3 +20,12 @@ git clone https://github.com/automateyournetwork/Vision_MCP_for_Gemini_CLI
         "/home/johncapobianco/Vision_MCP_for_Gemini_CLI/vision_mcp.py"
       ]
     }, 
+
+### Install the dependencies 
+
+```bash
+cd Vision_MCP_for_Gemini_CLI
+python3 -m venv visionmcp
+source visionmcp/bin/activate
+python3 -m pip install -r requirements.txt
+```
