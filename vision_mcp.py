@@ -1,20 +1,20 @@
 #!/usr/bin/env python3
 """
-MCP Server: Vision (webcam still-frame capture)
+MCP Server: Vision (webcam still-frame + burst capture)
 Tools:
   - list_cameras(max_index?: int=10)
   - vision_start(camera_index?: int=0, width?: int=640, height?: int=480, fps?: int=15, backend?: str="auto")
   - vision_status()
   - vision_capture(save_dir?: str="~/.vision_frames", format?: "jpg"|"png"="jpg")
+  - vision_burst(n?: int=8, period_ms?: int=150, save_dir?: str=".", format?: "jpg"|"png"="jpg", warmup?: int=3, duration_ms?: int=0)
   - vision_stop()
 
 Notes:
-- Pure MCP over stdio (FastMCP).
-- Logs to stderr only.
-- No network calls; local-only capture.
+- No base64 in responses (optimized for @file attachment flow).
+- Pure MCP over stdio (FastMCP). Logs to stderr only. No network calls.
 """
 
-import os, sys, io, base64, time, logging
+import os, sys, time, logging
 from pathlib import Path
 from typing import Optional, Dict, Any, Tuple
 
@@ -30,7 +30,6 @@ log = logging.getLogger("VisionMCP")
 try:
     from mcp.server.fastmcp import FastMCP
 except Exception:
-    # fallback if installed as 'fastmcp'
     from fastmcp import FastMCP  # type: ignore
 
 # ---------- OpenCV ----------
@@ -136,7 +135,6 @@ def list_cameras(max_index: int = 10) -> Dict[str, Any]:
             cap = cv2.VideoCapture(i)
             ok = bool(cap and cap.isOpened())
             if ok:
-                # Read quick props
                 w = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH) or 0)
                 h = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT) or 0)
                 fps = float(cap.get(cv2.CAP_PROP_FPS) or 0.0)
@@ -186,7 +184,8 @@ def vision_capture(
     format: str = "jpg",
 ) -> Dict[str, Any]:
     """
-    Capture one frame. Saves to save_dir and returns path + base64.
+    Capture one frame. Saves to save_dir and returns the saved path and metadata.
+    (No base64 returned.)
     """
     ok, frame, msg = _grab_frame()
     if not ok:
@@ -196,7 +195,6 @@ def vision_capture(
     if not ok2:
         return {"ok": False, "error": ext}
 
-    # Save to disk
     out_dir = Path(os.path.expanduser(save_dir))
     out_dir.mkdir(parents=True, exist_ok=True)
     fname = _timestamp_name("frame", ext)
@@ -207,14 +205,92 @@ def vision_capture(
     except Exception as e:
         return {"ok": False, "error": f"Failed to write file: {e}"}
 
-    b64 = base64.b64encode(img_bytes).decode("ascii")
     return {
         "ok": True,
         "path": str(fpath),
-        "bytes_base64": b64,
         "mime": "image/jpeg" if ext == ".jpg" else "image/png",
         "width": int(_CAM["props"].get("width", 0)),
         "height": int(_CAM["props"].get("height", 0)),
+    }
+
+@mcp.tool()
+def vision_burst(
+    n: int = 8,
+    period_ms: int = 150,
+    save_dir: str = ".",
+    format: str = "jpg",
+    warmup: int = 3,
+    duration_ms: int = 0,  # optional duration override
+) -> Dict[str, Any]:
+    """
+    Capture N frames spaced by period_ms and return their file paths (chronological).
+    If duration_ms > 0, n is computed as round(duration_ms / period_ms).
+    (No base64 returned.)
+    """
+    cap = _CAM["cap"]
+    if cap is None or not cap.isOpened():
+        return {"ok": False, "error": "Camera not open"}
+
+    # compute n from duration if provided
+    if duration_ms and duration_ms > 0:
+        n = max(1, int(round(float(duration_ms) / float(period_ms))))
+
+    try:
+        cap.set(cv2.CAP_PROP_BUFFERSIZE, 1)
+    except Exception:
+        pass
+
+    for _ in range(max(0, int(warmup))):
+        cap.read()
+
+    out_dir = Path(os.path.expanduser(save_dir))
+    out_dir.mkdir(parents=True, exist_ok=True)
+
+    ext = ".jpg" if format.lower() == "jpg" else ".png"
+    mime = "image/jpeg" if ext == ".jpg" else "image/png"
+    width = int(_CAM["props"].get("width", 0))
+    height = int(_CAM["props"].get("height", 0))
+
+    period_s = max(0.0, float(period_ms) / 1000.0)
+    t0 = time.perf_counter()
+
+    paths: list[str] = []
+    for i in range(max(1, int(n))):
+        target = t0 + i * period_s
+        now = time.perf_counter()
+        if target > now:
+            time.sleep(target - now)
+
+        ok, frame, msg = _grab_frame()
+        if not ok or frame is None:
+            return {"ok": False, "error": f"Failed to read frame: {msg}", "paths": paths}
+
+        ok2, img_bytes, _ = _encode_image(frame, format)
+        if not ok2:
+            return {"ok": False, "error": "cv2.imencode failed", "paths": paths}
+
+        ts = time.strftime("%Y%m%d_%H%M%S")
+        ms = int((time.time() % 1) * 1000)
+        fname = f"asl_{ts}_{ms:03d}_{i:02d}{ext}"
+        fpath = out_dir / fname
+        with open(fpath, "wb") as f:
+            f.write(img_bytes)
+        paths.append(str(fpath))
+
+        # Optional progress logs (stderr)
+        if i == 0 or (i + 1) % 5 == 0 or (i + 1) == n:
+            log.info("Burst capture %d/%d saved %s", i + 1, n, fpath.name)
+
+    return {
+        "ok": True,
+        "paths": paths,
+        "mime": mime,
+        "width": width,
+        "height": height,
+        "n": len(paths),
+        "period_ms": period_ms,
+        "duration_ms": duration_ms,
+        "save_dir": str(out_dir),
     }
 
 @mcp.tool()
@@ -226,5 +302,4 @@ def vision_stop() -> Dict[str, Any]:
     return {"ok": True}
 
 if __name__ == "__main__":
-    # Start MCP stdio loop
     mcp.run()
